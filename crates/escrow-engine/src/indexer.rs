@@ -7,16 +7,21 @@
 //! applied, and an older event is recognised as stale instead of being applied twice.
 
 use crate::{error::EngineError, jobs};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use escrow_chain::{ChainError, ChainEvent, ChainReader, EventSource, EventsPage, events::cursor_ledger};
-use escrow_db::{Db, bounties, disputes, intents, payouts, users, webhooks};
+use escrow_db::{Db, audit, bounties, disputes, intents, payouts, untracked, users, webhooks};
+use serde_json::json;
 use sqlx::PgConnection;
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration as StdDuration};
 use tokio_util::sync::CancellationToken;
 
 pub const CURSOR_ID: &str = "bounty_escrow";
-const PAGE_LIMIT: u32 = 200;
-const MAX_PAGES: usize = 200;
+pub const PAGE_LIMIT: u32 = 200;
+pub const MAX_PAGES: usize = 200;
+/// After this many consecutive poll failures, an alert is raised.
+pub const FAILURE_ALERT_THRESHOLD: u32 = 5;
+/// Maximum backoff between retries when failing repeatedly.
+const MAX_BACKOFF_SECS: u64 = 60;
 
 #[derive(Clone)]
 pub struct IndexerDeps {
@@ -54,6 +59,24 @@ pub async fn apply_event(conn: &mut PgConnection, ev: &ChainEvent, meta: &EventM
         let repo_id = i64::try_from(*repo_id).unwrap_or(0);
         // anyone can fund any repository on chain; we only track the ones with our App installed
         let Some(repo) = escrow_db::github::get_repo(&mut *conn, repo_id).await? else {
+            // Store the untracked funded event so it can be applied later when the repo is installed
+            untracked::store_untracked_funded(
+                &mut *conn,
+                meta.event_id,
+                ev.bounty_id(),
+                u64::try_from(repo_id).unwrap_or(0),
+                *issue,
+                maintainer,
+                token,
+                *amount,
+                *fee_bps,
+                DateTime::from_timestamp(i64::try_from(*deadline).unwrap_or(0), 0).unwrap_or(meta.closed_at),
+                *relayer_allowed,
+                0, // ledger will be filled by the caller
+                meta.tx_hash,
+                meta.closed_at,
+            )
+            .await?;
             return Ok(Outcome::Untracked);
         };
         if let Some(existing) = bounties::get(&mut *conn, id).await? {
@@ -88,6 +111,8 @@ pub async fn apply_event(conn: &mut PgConnection, ev: &ChainEvent, meta: &EventM
             },
         )
         .await?;
+        // Clean up any untracked event for this bounty now that it's tracked
+        untracked::delete_untracked_by_bounty(&mut *conn, id).await?;
         return Ok(Outcome::Applied);
     }
 
@@ -139,6 +164,8 @@ pub struct PollReport {
     pub anomalies: usize,
     /// the saved cursor was outside the RPC's retention; it was dropped and the next poll restarts from the fallback
     pub cursor_reset: bool,
+    /// true when the poll caught up to the chain tip; false when it stopped because MAX_PAGES was reached
+    pub caught_up: bool,
 }
 
 async fn fetch(d: &IndexerDeps, saved: Option<&escrow_db::IndexerCursor>) -> Result<EventsPage, ChainError> {
@@ -195,6 +222,25 @@ pub async fn poll_once(d: &IndexerDeps) -> Result<PollReport, EngineError> {
                 }
                 Outcome::Anomaly => {
                     report.anomalies += 1;
+                    // Fetch the stored status for the audit log
+                    let stored_status = bounties::get(&mut *tx, i64::try_from(ev.bounty_id()).unwrap_or(0))
+                        .await?
+                        .map(|b| b.status().to_string())
+                        .unwrap_or_else(|| "UNKNOWN".to_string());
+                    // Persist anomaly to audit log for admin visibility
+                    audit::log(
+                        &mut *tx,
+                        "indexer",
+                        "anomaly_detected",
+                        &format!("bounty:{}", ev.bounty_id()),
+                        &json!({
+                            "eventId": raw.id,
+                            "kind": ev.kind(),
+                            "bountyId": ev.bounty_id(),
+                            "storedStatus": stored_status,
+                        }),
+                    )
+                    .await?;
                     tracing::warn!(event = %raw.id, kind = ev.kind(), "anomalous event ignored");
                 }
                 Outcome::Stale | Outcome::Untracked => {}
@@ -207,18 +253,99 @@ pub async fn poll_once(d: &IndexerDeps) -> Result<PollReport, EngineError> {
         let caught_up = cursor_ledger(&page.cursor) + 1 >= page.latest_ledger
             || saved.as_ref().and_then(|s| s.cursor.as_deref()) == Some(page.cursor.as_str());
         if page.events.len() < PAGE_LIMIT as usize && caught_up {
+            report.caught_up = true;
             break;
         }
     }
     Ok(report)
 }
 
-pub async fn run(d: IndexerDeps, stop: CancellationToken, interval: Duration) {
+/// Applies all stored untracked funded events for a newly installed repository.
+/// Returns the number of events applied.
+pub async fn apply_untracked_for_repo(db: &Db, repo_id: i64) -> Result<usize, sqlx::Error> {
+    let events = untracked::get_untracked_for_repo(&db.pool, repo_id).await?;
+    let mut applied = 0;
+    for ev in events {
+        // Check if bounty already exists (could have been created by a later reindex)
+        if bounties::get(&db.pool, ev.bounty_id).await?.is_some() {
+            untracked::delete_untracked_by_bounty(&db.pool, ev.bounty_id).await?;
+            continue;
+        }
+        // Need to get the repo to have the full_name for the issue_url
+        let Some(repo) = escrow_db::github::get_repo(&db.pool, repo_id).await? else {
+            continue;
+        };
+        let issue_number = ev.issue_number;
+        let intent = intents::find_unused_match(&db.pool, repo_id, issue_number, &ev.token, ev.amount_i128()).await?;
+        if let Some(i) = &intent {
+            intents::mark_used(&db.pool, &i.id, ev.closed_at).await?;
+        }
+        bounties::insert(
+            &db.pool,
+            &bounties::NewBounty {
+                id: ev.bounty_id,
+                repo_id,
+                issue_number,
+                issue_url: &format!("https://github.com/{}/issues/{issue_number}", repo.full_name),
+                maintainer: &ev.maintainer,
+                maintainer_github_id: intent.map(|i| i.requested_by),
+                token: &ev.token,
+                amount: ev.amount_i128(),
+                fee_bps: ev.fee_bps,
+                deadline: ev.deadline,
+                relayer_allowed: ev.relayer_allowed,
+                fund_tx: &ev.tx_hash,
+                created_at: ev.closed_at,
+                last_event_id: &ev.event_id,
+            },
+        )
+        .await?;
+        untracked::delete_untracked_by_bounty(&db.pool, ev.bounty_id).await?;
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// Returns the minimum ledger from untracked events for a repo, to tell the operator where to reindex from.
+pub async fn min_untracked_ledger_for_repo(db: &Db, repo_id: i64) -> Result<Option<i32>, sqlx::Error> {
+    untracked::min_untracked_ledger_for_repo(&db.pool, repo_id).await
+}
+
+pub async fn run(d: IndexerDeps, stop: CancellationToken, interval: StdDuration) {
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff: StdDuration = StdDuration::from_secs(1);
+
     while !stop.is_cancelled() {
         match poll_once(&d).await {
-            Ok(r) if r.applied > 0 || r.anomalies > 0 => tracing::info!(?r, "indexed"),
-            Ok(_) => {}
-            Err(e) => tracing::error!(error = %e, "indexer poll failed"),
+            Ok(r) => {
+                consecutive_failures = 0;
+                backoff = StdDuration::from_secs(1);
+                if r.applied > 0 || r.anomalies > 0 {
+                    tracing::info!(?r, "indexed");
+                }
+                if !r.caught_up {
+                    // Still behind, poll again immediately without sleeping the full interval
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "indexer poll failed");
+                consecutive_failures += 1;
+                if consecutive_failures >= FAILURE_ALERT_THRESHOLD {
+                    tracing::error!(
+                        error = %e,
+                        consecutive_failures,
+                        "indexer has failed repeatedly; alerting"
+                    );
+                }
+                // Back off up to a cap while failing
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(StdDuration::from_secs(MAX_BACKOFF_SECS));
+                continue;
+            }
         }
         tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(interval) => {} }
     }

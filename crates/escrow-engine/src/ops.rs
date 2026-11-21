@@ -3,7 +3,7 @@
 use crate::indexer::CURSOR_ID;
 use chrono::{DateTime, Duration, Utc};
 use escrow_chain::ChainReader;
-use escrow_db::{Db, disputes, jobs, payouts, webhooks};
+use escrow_db::{Db, audit, disputes, jobs, payouts, webhooks};
 use serde::Serialize;
 use std::{collections::HashMap, sync::Mutex, time::Instant};
 
@@ -97,6 +97,12 @@ pub async fn collect_alerts(db: &Db, a: &AlertInputs) -> Result<Vec<Alert>, sqlx
     let dead = jobs::count_dead(&db.pool).await?;
     if dead > 0 {
         out.push(Alert::new("jobs_dead", format!("{dead} background job(s) gave up and are dead (see the jobs table)")));
+    }
+    // Alert on any new anomalies in the last 24 hours
+    let anomaly_count = audit::count_anomalies_24h(&db.pool).await?;
+    if anomaly_count > 0 {
+        let word = if anomaly_count == 1 { "anomaly" } else { "anomalies" };
+        out.push(Alert::new("indexer_anomalies", format!("{anomaly_count} indexer {word} in the last 24h")));
     }
     Ok(out)
 }

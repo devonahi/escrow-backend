@@ -272,6 +272,7 @@ pub async fn status(
 ) -> ApiResult<Json<serde_json::Value>> {
     admin(&s, &headers, &ip, false).await?;
     let cursor = webhooks::get_cursor(&s.db.pool, CURSOR_ID).await?;
+    let anomaly_count = audit::count_anomalies_24h(&s.db.pool).await?;
     Ok(Json(json!({
         "indexerLedger": cursor.as_ref().map(|c| c.ledger), "indexerUpdatedAt": cursor.map(|c| c.updated_at),
         "failedPayouts": payouts::count_by_status(&s.db.pool, &["FAILED"]).await?,
@@ -281,5 +282,6 @@ pub async fn status(
         "pendingJobs": jobs::count_pending(&s.db.pool).await?,
         // sign-in exists only with the GitHub App; without it, GitHub jobs are not claimed and wait here
         "waitingForGithub": if s.login.is_some() { 0 } else { escrow_engine::jobs::count_waiting_for_github(&s.db.pool).await? },
+        "anomalies24h": anomaly_count,
     })))
 }

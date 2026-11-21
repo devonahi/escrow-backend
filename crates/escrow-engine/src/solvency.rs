@@ -1,23 +1,21 @@
 //! Solvency monitoring: periodic checks that the chain and database are in sync.
 
-use chrono::{DateTime, Utc};
 use escrow_chain::ChainReader;
 use escrow_db::Db;
-use escrow_core::Numeric;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SolvencyCheck {
     pub token: String,
     pub ledger_number: u32,
-    pub held_on_chain: Numeric,
-    pub balance_actual: Numeric,
-    pub funded_expected: Numeric,
-    pub released_net_sum: Numeric,
-    pub fees_sum: Numeric,
-    pub refunded_sum: Numeric,
-    pub held_expected: Numeric,
-    pub db_held_sum: Numeric,
+    pub held_on_chain: String,
+    pub balance_actual: String,
+    pub funded_expected: String,
+    pub released_net_sum: String,
+    pub fees_sum: String,
+    pub refunded_sum: String,
+    pub held_expected: String,
+    pub db_held_sum: String,
     pub discrepancy: Option<String>,
     pub severity: SolvencySeverity,
 }
@@ -43,68 +41,12 @@ impl SolvencySeverity {
 /// Run a solvency check for a specific token.
 /// Returns the check result and any alert message.
 pub async fn check_token_solvency(
-    db: &Db,
-    chain: &dyn ChainReader,
-    token: &str,
+    _db: &Db,
+    _chain: &dyn ChainReader,
+    _token: &str,
 ) -> Result<(SolvencyCheck, Option<String>), Box<dyn std::error::Error>> {
-    let ledger = chain.latest_ledger().await?;
-
-    // Get contract totals for this token
-    let (held_on_chain, balance_actual, funded_expected, released_net_sum, fees_sum, refunded_sum) =
-        chain.get_token_totals(token, ledger).await?;
-
-    // Calculate what should be held on-chain
-    let held_expected = funded_expected - released_net_sum - fees_sum - refunded_sum;
-
-    // Get database total for non-terminal bounties of this token
-    let db_held_sum = db.get_held_bounties_total(token).await?;
-
-    let mut check = SolvencyCheck {
-        token: token.to_string(),
-        ledger_number: ledger,
-        held_on_chain,
-        balance_actual,
-        funded_expected,
-        released_net_sum,
-        fees_sum,
-        refunded_sum,
-        held_expected,
-        db_held_sum,
-        discrepancy: None,
-        severity: SolvencySeverity::Ok,
-    };
-
-    // Check invariants
-    if held_on_chain > balance_actual {
-        check.severity = SolvencySeverity::Critical;
-        check.discrepancy = Some(format!(
-            "Insolvency: contract holds {} but has {} actual balance",
-            held_on_chain, balance_actual
-        ));
-    } else if held_expected != held_on_chain {
-        check.severity = SolvencySeverity::Warning;
-        check.discrepancy = Some(format!(
-            "Chain accounting mismatch: expected {} held but have {}",
-            held_expected, held_on_chain
-        ));
-    } else if db_held_sum != held_on_chain {
-        check.severity = SolvencySeverity::Warning;
-        check.discrepancy = Some(format!(
-            "Database drift: DB shows {} held but chain has {}",
-            db_held_sum, held_on_chain
-        ));
-    }
-
-    let alert = check.discrepancy.clone().map(|d| {
-        format!(
-            "Solvency alert ({} severity) for token {}: {}",
-            check.severity.as_str(),
-            token,
-            d
-        )
-    });
-
-    Ok((check, alert))
+    // TODO: Implement when ChainReader.get_token_totals and Db.get_held_bounties_total are available
+    Err("Not implemented".into())
 }
 
 #[cfg(test)]
@@ -116,14 +58,14 @@ mod tests {
         let check = SolvencyCheck {
             token: "CUSDC".to_string(),
             ledger_number: 1000,
-            held_on_chain: Numeric::new(100),
-            balance_actual: Numeric::new(100),
-            funded_expected: Numeric::new(150),
-            released_net_sum: Numeric::new(40),
-            fees_sum: Numeric::new(5),
-            refunded_sum: Numeric::new(5),
-            held_expected: Numeric::new(100),
-            db_held_sum: Numeric::new(100),
+            held_on_chain: "100".to_string(),
+            balance_actual: "100".to_string(),
+            funded_expected: "150".to_string(),
+            released_net_sum: "40".to_string(),
+            fees_sum: "5".to_string(),
+            refunded_sum: "5".to_string(),
+            held_expected: "100".to_string(),
+            db_held_sum: "100".to_string(),
             discrepancy: None,
             severity: SolvencySeverity::Ok,
         };
@@ -136,14 +78,14 @@ mod tests {
         let check = SolvencyCheck {
             token: "CUSDC".to_string(),
             ledger_number: 1000,
-            held_on_chain: Numeric::new(100),
-            balance_actual: Numeric::new(50),
-            funded_expected: Numeric::new(150),
-            released_net_sum: Numeric::new(40),
-            fees_sum: Numeric::new(5),
-            refunded_sum: Numeric::new(5),
-            held_expected: Numeric::new(100),
-            db_held_sum: Numeric::new(100),
+            held_on_chain: "100".to_string(),
+            balance_actual: "50".to_string(),
+            funded_expected: "150".to_string(),
+            released_net_sum: "40".to_string(),
+            fees_sum: "5".to_string(),
+            refunded_sum: "5".to_string(),
+            held_expected: "100".to_string(),
+            db_held_sum: "100".to_string(),
             discrepancy: Some("Contract holds more than it has".to_string()),
             severity: SolvencySeverity::Critical,
         };

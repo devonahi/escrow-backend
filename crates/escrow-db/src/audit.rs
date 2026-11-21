@@ -1,5 +1,6 @@
 //! Append-only audit trail. It also serves as the "already sent" memory for reminders and announcements.
 
+use chrono::{DateTime, Utc};
 use crate::new_id;
 use sqlx::PgExecutor;
 
@@ -34,4 +35,13 @@ pub async fn recent<'e>(ex: impl PgExecutor<'e>, limit: i64) -> Result<Vec<crate
         .bind(limit)
         .fetch_all(ex)
         .await
+}
+
+/// Counts anomaly_detected audit entries in the last 24 hours.
+pub async fn count_anomalies_24h<'e>(ex: impl PgExecutor<'e>) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'anomaly_detected' AND created_at > NOW() - INTERVAL '24 hours'"
+    )
+    .fetch_one(ex)
+    .await
 }
